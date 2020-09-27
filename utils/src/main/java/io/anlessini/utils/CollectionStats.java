@@ -15,6 +15,7 @@ import org.apache.lucene.index.IndexableField;
 import org.kohsuke.args4j.*;
 
 import java.io.File;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -49,8 +50,45 @@ public class CollectionStats {
   private final Class generatorClass;
   private final Counters counters;
   private final DocumentCollection collection;
-  private final Collection<Map<String, Long>> itemSizes;
+  private final Collection<Map<String, Stats>> allFieldStats;
   private final Set<String> fieldNames;
+
+  public static final class Stats {
+    public final BigInteger count;
+    public final long max;
+    public final long min;
+    public final BigInteger avg;
+
+    public Stats() {
+      this(BigInteger.ZERO, Long.MIN_VALUE, Long.MAX_VALUE, BigInteger.ZERO);
+    }
+
+    public Stats(BigInteger count, long max, long min, BigInteger avg) {
+      this.count = count;
+      this.max = max;
+      this.min = min;
+      this.avg = avg;
+    }
+
+    public Stats addPoint(long point) {
+      long newMax = Math.max(point, max);
+      long newMin = Math.min(point, min);
+      BigInteger newCount = count.add(BigInteger.ONE);
+      BigInteger newAvg = ((avg.multiply(count)).add(BigInteger.valueOf(point))).divide(newCount);
+
+      return new Stats(newCount, newMax, newMin, newAvg);
+    }
+
+    public static Stats combine(Stats first, Stats second) {
+      long newMax = Math.max(first.max, second.max);
+      long newMin = Math.min(first.min, second.min);
+      BigInteger newCount = first.count.add(second.count);
+      BigInteger newAvg = newCount.equals(BigInteger.ZERO) ? BigInteger.ZERO
+          : ((first.avg.multiply(first.count)).add(second.avg.multiply(second.count))).divide(newCount);
+
+      return new Stats(newCount, newMax, newMin, newAvg);
+    }
+  }
 
   public final class Counters {
     /**
@@ -94,7 +132,7 @@ public class CollectionStats {
     collection = (DocumentCollection) collectionClass.getConstructor(Path.class).newInstance(collectionPath);
 
     counters = new Counters();
-    itemSizes = new ConcurrentLinkedQueue<>();
+    allFieldStats = new ConcurrentLinkedQueue<>();
     fieldNames = Collections.newSetFromMap(new ConcurrentHashMap<>());
   }
 
@@ -137,15 +175,15 @@ public class CollectionStats {
     LOG.info("=================== Collection Stats ==================");
     LOG.info(String.format("%-20s %10s %10s %10s %10s %10s %10s", "Field", "Max(bytes)", "Min(bytes)", "Avg(bytes)", "Max(KB)", "Min(KB)", "Avg(KB)"));
     for (String fieldName: fieldNames) {
-      LongSummaryStatistics stats = itemSizes.stream().map(m -> m.getOrDefault(fieldName, 0L)).mapToLong(l -> l).summaryStatistics();
+      Stats stats = allFieldStats.stream().map(m -> m.getOrDefault(fieldName, new Stats())).reduce(Stats::combine).get();
       LOG.info(String.format("%-20s %,10d %,10d %,10d %,10d %,10d %,10d",
-          fieldName, stats.getMax(), stats.getMin(), Math.round(stats.getAverage()),
-          stats.getMax() / 1024, stats.getMin() / 1024, Math.round(stats.getAverage()) / 1024));
+          fieldName, stats.max, stats.min, stats.avg.longValueExact(),
+          stats.max / 1024, stats.min / 1024, stats.avg.longValueExact() / 1024));
     }
-    LongSummaryStatistics totalItemStats = itemSizes.stream().map(m -> m.getOrDefault("TOTAL_ITEM_SIZE", 0L)).mapToLong(l -> l).summaryStatistics();
+    Stats totalItemStats = allFieldStats.stream().map(m -> m.getOrDefault("TOTAL_ITEM_SIZE", new Stats())).reduce(Stats::combine).get();
     LOG.info(String.format("%-20s %,10d %,10d %,10d %,10d %,10d %,10d",
-        "total", totalItemStats.getMax(), totalItemStats.getMin(), Math.round(totalItemStats.getAverage()),
-        totalItemStats.getMax() / 1024, totalItemStats.getMin() / 1024, Math.round(totalItemStats.getAverage()) / 1024));
+        "total", totalItemStats.max, totalItemStats.min, totalItemStats.avg.longValueExact(),
+        totalItemStats.max / 1024, totalItemStats.min / 1024, totalItemStats.avg.longValueExact() / 1024));
   }
 
   private final class ComputingThread extends Thread {
@@ -167,6 +205,8 @@ public class CollectionStats {
             (LuceneDocumentGenerator) generatorClass.getDeclaredConstructor(IndexArgs.class).newInstance(new IndexArgs());
 
         long cnt = 0;
+
+        Map<String, Stats> fieldStats = new HashMap<>();
 
         // in order to call close() and clean up resources in case of exception
         fileSegment = collection.createFileSegment(input);
@@ -192,7 +232,6 @@ public class CollectionStats {
             continue;
           }
 
-          Map<String, Long> itemSize = new HashMap<>();
           long totalLength = 0;
           Item item = toDynamoDBItem(doc);
           for (Map.Entry<String, Object> entry: item.attributes()) {
@@ -208,12 +247,15 @@ public class CollectionStats {
                 fieldSize += value.getBytes(StandardCharsets.UTF_8).length;
               }
             }
-            itemSize.put(fieldName, fieldSize);
+            Stats fieldStat = fieldStats.getOrDefault(fieldName, new Stats());
+            fieldStats.put(fieldName, fieldStat.addPoint(fieldSize));
             totalLength += fieldSize;
           }
-          itemSize.put("TOTAL_ITEM_SIZE", totalLength);
-          itemSizes.add(itemSize);
+          Stats fieldStat = fieldStats.getOrDefault("TOTAL_ITEM_SIZE", new Stats());
+          fieldStats.put("TOTAL_ITEM_SIZE",fieldStat.addPoint(totalLength));
         }
+
+        allFieldStats.add(fieldStats);
 
         int skipped = fileSegment.getSkippedCount();
         if (skipped > 0) {
