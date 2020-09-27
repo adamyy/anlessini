@@ -24,6 +24,10 @@
               <mainClass>io.anlessini.utils.ImportCollection</mainClass>
               <id>ImportCollection</id>
             </program>
+            <program>
+              <mainClass>io.anlessini.utils.CollectionStats</mainClass>
+              <id>CollectionStats</id>
+            </program>
           </programs>
         </configuration>
         <executions>
