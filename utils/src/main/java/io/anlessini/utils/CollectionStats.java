@@ -52,6 +52,8 @@ public class CollectionStats {
   private final DocumentCollection collection;
   private final Collection<Map<String, Stats>> allFieldStats;
   private final Set<String> fieldNames;
+  private static final long DYNAMO_ITEM_SIZE_LIMIT = 400 * 1024; // 400 KB
+  private final ConcurrentLinkedQueue<String> largeItemDocids;
 
   public static final class Stats {
     public final BigInteger count;
@@ -92,9 +94,9 @@ public class CollectionStats {
 
   public final class Counters {
     /**
-     * Counter for successfully imported documents
+     * Counter for documents processed
      */
-    public AtomicLong imported = new AtomicLong();
+    public AtomicLong computed = new AtomicLong();
 
     /**
      * Counter for empty documents that are not imported
@@ -134,6 +136,7 @@ public class CollectionStats {
     counters = new Counters();
     allFieldStats = new ConcurrentLinkedQueue<>();
     fieldNames = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    largeItemDocids = new ConcurrentLinkedQueue<>();
   }
 
   public void run() {
@@ -159,10 +162,10 @@ public class CollectionStats {
       // Wait for existing tasks to terminate
       while (!executor.awaitTermination(1, TimeUnit.MINUTES)) {
         if (segmentCnt == 1) {
-          LOG.info(String.format("%,d documents imported", counters.imported.get()));
+          LOG.info(String.format("%,d documents computed", counters.computed.get()));
         } else {
-          LOG.info(String.format("%.2f%% of files completed, %,d documents imported",
-              (double) executor.getCompletedTaskCount() / segmentCnt * 100.0d, counters.imported.get()));
+          LOG.info(String.format("%.2f%% of files completed, %,d documents computed",
+              (double) executor.getCompletedTaskCount() / segmentCnt * 100.0d, counters.computed.get()));
         }
       }
     } catch (InterruptedException ie) {
@@ -184,6 +187,15 @@ public class CollectionStats {
     LOG.info(String.format("%-20s %,10d %,10d %,10d %,10d %,10d %,10d",
         "total", totalItemStats.max, totalItemStats.min, totalItemStats.avg.longValueExact(),
         totalItemStats.max / 1024, totalItemStats.min / 1024, totalItemStats.avg.longValueExact() / 1024));
+    LOG.info(String.format("Total number of large item: %d", largeItemDocids.size()));
+    LOG.info(String.format("Large Item docids: %s", largeItemDocids.toString()));
+
+    LOG.info("============ Final Counter Values ============");
+    LOG.info(String.format("computed:    %,12d", counters.computed.get()));
+    LOG.info(String.format("unindexable: %,12d", counters.unindexable.get()));
+    LOG.info(String.format("empty:       %,12d", counters.empty.get()));
+    LOG.info(String.format("skipped:     %,12d", counters.skipped.get()));
+    LOG.info(String.format("errors:      %,12d", counters.errors.get()));
   }
 
   private final class ComputingThread extends Thread {
@@ -253,6 +265,11 @@ public class CollectionStats {
           }
           Stats fieldStat = fieldStats.getOrDefault("TOTAL_ITEM_SIZE", new Stats());
           fieldStats.put("TOTAL_ITEM_SIZE",fieldStat.addPoint(totalLength));
+          if (totalLength > DYNAMO_ITEM_SIZE_LIMIT) {
+            largeItemDocids.add(item.getString("id"));
+          }
+
+          counters.computed.incrementAndGet();
         }
 
         allFieldStats.add(fieldStats);
